@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 
 #include <openssl/bn.h>
 #include <openssl/pem.h>
@@ -88,7 +89,16 @@ strnlen(const char *s, size_t ml)
 #define ONION_LENP1	17			/* Onion name length plus 1 */
 #define MAX_THREADS	100			/* Maximum number of threads */
 #define MAX_WORDS	0xFFFFFFFFu		/* Maximum words to read from file */
+#define ONION_LEN 16
 #define BASE32_ALPHABET	"abcdefghijklmnopqrstuvwxyz234567"
+#define BASE16_ALPHABET "0123456789ABCDEF"
+
+/** Time period for which a v2 descriptor will be valid. */
+#define REND_TIME_PERIOD_V2_DESC_VALIDITY (24*60*60)
+#define REND_NUMBER_OF_NON_CONSECUTIVE_REPLICAS 2
+#define REND_SERVICE_ID_LEN 10
+#define REND_DESC_COOKIE_LEN 16
+
 
 extern char	*__progname;
 
@@ -111,6 +121,12 @@ static _Bool		validkey(RSA *);
 static signed int	compare(const void *, const void *);
 static void		base32_enc(uint8_t *, uint8_t *);
 static void		base32_dec(uint8_t *, uint8_t *);
+static void		base16_enc(uint8_t *, uint8_t *, unsigned int length);
+static int		base16_dec(uint8_t *, char *, unsigned int *);
+static int
+rend_compute_v2_desc_id(uint8_t *, uint8_t *,
+                        const char *, time_t now,
+                        uint8_t replica);
 static void		onion_enc(uint8_t *, RSA *);
 static void		zerobits(uint16_t * ind, uint64_t * word,
 				 uint8_t * buffer, unsigned int length);
@@ -119,8 +135,9 @@ static void		*worker(void *);
 
 /* Global variables */
 /* TODO: perhaps getting rid of so many globals is in order... */
-_Bool			done, cflag, fflag, nflag, pflag, rflag, vflag;
-unsigned int		minlen, maxlen, threads, prefixlen, wordcount;
+_Bool			done, cflag, fflag, nflag, pflag, rflag, vflag, descflag, fpflag;
+unsigned int		minlen, maxlen, threads, prefixlen, wordcount, prefixbytelen;
+uint32_t desctime;
 char			fn[FILENAME_MAX + 1], prefix[ONION_LENP1];
 regex_t			*regex;
 
@@ -137,13 +154,13 @@ main(int argc, char *argv[])
 	unsigned int	i, j, dupcount = 0;
 
 	/* Initialize global flags */
-	wordcount = done = cflag = fflag = nflag = pflag = rflag = vflag = 0;
+	wordcount = done = cflag = fflag = nflag = pflag = rflag = vflag = descflag = fpflag = 0;
 	minlen = 8;
 	maxlen = 16;
 	threads = 1;
         msg = normal;	/* Default: non-verbose */
         search = NULL;	/* No default search, has to be specified */
-	
+
 	setoptions(argc, argv);
 
 	if (fflag) {
@@ -227,13 +244,24 @@ worker(void *arg)
 	uint8_t		*tmp, *der,
 			buf[SHA_DIGEST_LENGTH],
 			onion[ONION_LENP1],
-			onionfinal[ONION_LENP1];
+			fingerprint[(SHA_DIGEST_LENGTH*2)+1],
+			onionfinal[ONION_LENP1],
+			prefixbytes[ONION_LENP1],
+			digest[SHA_DIGEST_LENGTH],
+			descriptor_id[SHA_DIGEST_LENGTH],
+			descriptor_hex[(SHA_DIGEST_LENGTH*2)+1];
 	signed int	derlen;
 	uint64_t	*counter;
 	/* Public exponent and the "big-endian" version of it */
-	unsigned int	e, e_be;
+	unsigned int	e, e_be, i;
 
 	counter = (uint64_t *)arg;
+
+	if(pflag && (fpflag || descflag)){
+		/* Decode the hex encoded prefix */
+		if(base16_dec(prefixbytes, prefix, &prefixbytelen))
+			error("The prefix is not a valid hex encoded string\n");
+	}
 
 	while (!done) {
 		/* Generate a new RSA key every time e reaches RSA_E_LIMIT */
@@ -241,10 +269,10 @@ worker(void *arg)
 		    NULL, NULL);
 		if (!rsa)
 			error("RSA Key Generation failed!\n");
-		
+
 		/* Too chatty - disable. */
 		/* msg("Generated a new RSA key pair.\n"); */
-		
+
 		/* Encode RSA key in X.690 DER format */
 		if((derlen = i2d_RSAPublicKey(rsa, NULL)) < 0)
 			error("DER encoding failed!\n");
@@ -271,61 +299,103 @@ worker(void *arg)
 			SHA1_Update(&copy, &e_be, SIZE_OF_E);
 			SHA1_Final(buf, &copy);
 			(*counter)++;
-			/* This is fairly fast, but can be faster if inlined. */
-			base32_enc(onion, buf);
 
-			/* The search speed varies based on the mode we are in.
-			 * Regex's performance depends on the expression used.
-			 * Fixed prefix is as fast as memcmp(3).
-			 * Wordlist performance depends on (mostly):
-			 *   number of "lengths" to search for (-l from-to);
-			 *   number of unique words loaded from file.
-			 *
-			 * Inlining everything and optimizing for one mode and
-			 * fixed word length improved the performance somewhat
-			 * when I tried it, but it's not worth it. */
-			if (search(buf, onion)) {
-				/* Found a possible key,
-				 * from here on down performance is not critical. */
-				if (!BN_bin2bn((uint8_t *)&e_be, SIZE_OF_E, rsa->e))
-					error("Failed to set e in RSA key!\n");
-				if (!validkey(rsa))
-					error("A bad key was found!\n");
-				if (pflag)
-					onion[prefixlen] = '\0';
+			if(fpflag){
+				/* In fingerprint mode, compare byte by byte */
+				if(memcmp(prefixbytes, buf, prefixbytelen)==0){
+					/* Found a possible match, confirm */
+					if (!BN_bin2bn((uint8_t *)&e_be, SIZE_OF_E, rsa->e))
+						error("Failed to set e in RSA key!\n");
+					if (!validkey(rsa))
+						error("A bad key was found!\n");
 
-				onion_enc(onionfinal, rsa);
+					onion_enc(digest, rsa);
+					base16_enc(fingerprint, digest, SHA_DIGEST_LENGTH);
+					printresult(rsa, fingerprint, fingerprint);
 
-				/* Every so often the onion found matches
-				 * whatever we were looking for, but the final
-				 * generated onion is garbage. I suspect a CPU
-				 * or RAM overheating, but it could be a subtle
-				 * bug somewhere. Hard to pin-point. According
-				 * to the reports I've seen, shallot has had a
-				 * similar problem.
-				 *
-				 * Happens most often in a wordlist search mode,
-				 * but I think I have seen it in a regex mode
-				 * as well. Does not seem to happen in a fixed
-				 * prefix mode.
-				 *
-				 * Adding this check to avoid producing garbage
-				 * results and to alleviate the problem a bit. */
-				if (strncmp((char *)onion, (char *)onionfinal,
-				    (!rflag ? strnlen((char *)onion, ONION_LENP1) : 16))) {
-					msg("\nWARNING! Error detected! CPU/RAM overheating?\n");
-					msg("Found %s, but finalized to %s.\n",
-					    (char *)onion, (char *)onionfinal);
-					msg("Suspending this thread for 30 seconds.\n");
-					sleep(30);
-					msg("Generating new RSA key.\n\n");
+					if (!cflag)
+						done = 1; /* Notify other threads. */
 					break;
-				} else
-					printresult(rsa, onion, onionfinal);
-				
-				if (!cflag)
-					done = 1; /* Notify other threads. */
-				break;
+				}
+			} else if(descflag){
+				/* In descriptor_id mode, check future descriptor */
+				base32_enc(onion, buf);
+				for(i=0; i < REND_NUMBER_OF_NON_CONSECUTIVE_REPLICAS; i++){
+					rend_compute_v2_desc_id(descriptor_id,						onion, NULL, desctime, i);
+					if(memcmp(prefixbytes, descriptor_id, prefixbytelen)==0){
+						/* Found a possible match, confirm */
+						if (!BN_bin2bn((uint8_t *)&e_be, SIZE_OF_E, rsa->e))
+							error("Failed to set e in RSA key!\n");
+						if (!validkey(rsa))
+							error("A bad key was found!\n");
+
+						base16_enc(descriptor_hex, descriptor_id, SHA_DIGEST_LENGTH);
+						printresult(rsa, onion, descriptor_hex);
+
+						if (!cflag)
+							done = 1; /* Notify other threads. */
+						break;
+					}
+				}
+
+			} else {
+				/* This is fairly fast, but can be faster if inlined. */
+				base32_enc(onion, buf);
+
+				/* The search speed varies based on the mode we are in.
+				 * Regex's performance depends on the expression used.
+				 * Fixed prefix is as fast as memcmp(3).
+				 * Wordlist performance depends on (mostly):
+				 *   number of "lengths" to search for (-l from-to);
+				 *   number of unique words loaded from file.
+				 *
+				 * Inlining everything and optimizing for one mode and
+				 * fixed word length improved the performance somewhat
+				 * when I tried it, but it's not worth it. */
+				if (search(buf, onion)) {
+					/* Found a possible key,
+					 * from here on down performance is not critical. */
+					if (!BN_bin2bn((uint8_t *)&e_be, SIZE_OF_E, rsa->e))
+						error("Failed to set e in RSA key!\n");
+					if (!validkey(rsa))
+						error("A bad key was found!\n");
+					if (pflag)
+						onion[prefixlen] = '\0';
+
+					onion_enc(digest, rsa);
+					base32_enc(onionfinal, digest);
+
+					/* Every so often the onion found matches
+					 * whatever we were looking for, but the final
+					 * generated onion is garbage. I suspect a CPU
+					 * or RAM overheating, but it could be a subtle
+					 * bug somewhere. Hard to pin-point. According
+					 * to the reports I've seen, shallot has had a
+					 * similar problem.
+					 *
+					 * Happens most often in a wordlist search mode,
+					 * but I think I have seen it in a regex mode
+					 * as well. Does not seem to happen in a fixed
+					 * prefix mode.
+					 *
+					 * Adding this check to avoid producing garbage
+					 * results and to alleviate the problem a bit. */
+					if (strncmp((char *)onion, (char *)onionfinal,
+					    (!rflag ? strnlen((char *)onion, ONION_LENP1) : 16))) {
+						msg("\nWARNING! Error detected! CPU/RAM overheating?\n");
+						msg("Found %s, but finalized to %s.\n",
+						    (char *)onion, (char *)onionfinal);
+						msg("Suspending this thread for 30 seconds.\n");
+						sleep(30);
+						msg("Generating new RSA key.\n\n");
+						break;
+					} else
+						printresult(rsa, onion, onionfinal);
+
+					if (!cflag)
+						done = 1; /* Notify other threads. */
+					break;
+				}
 			}
 		}
 		RSA_free(rsa);
@@ -356,7 +426,7 @@ readfile(void)
 		c = tolower(c);
 		inword = 0;
 		/* Only load words with digits if the -n option was used. */
-		if ((c >= 'a' && c <= 'z') || (nflag && c >= '2' && c <= '7')) {
+		if ((c >= 'a' && c <= 'z') || (!nflag && c >= '2' && c <= '7')) {
 				w[j++] = c;
 				inword = 1;
 			}
@@ -377,7 +447,7 @@ readfile(void)
 					error("realloc() failed!\n");
 
 				tree[ind].branch[tree[ind].count] = wrd;
-				tree[ind].count++; 
+				tree[ind].count++;
 				wordcount++;
 			}
 		}
@@ -391,7 +461,7 @@ readfile(void)
 }
 
 /* Check if the RSA key is ok (PKCS#1 v2.1). */
-_Bool	
+_Bool
 validkey(RSA *rsa)
 {
 	BN_CTX	*ctx = BN_CTX_new();
@@ -502,10 +572,39 @@ base32_dec (uint8_t *dst, uint8_t *src)
 	dst[9] = (tmp[14] << 5) |  tmp[15];
 }
 
+void base16_enc(uint8_t *dst, uint8_t *src, unsigned int length){
+    uint8_t *pos = src;
+    for(; pos < src+length; dst+=2, pos++){
+        dst[0] = BASE16_ALPHABET[(*pos>>4) & 0xF];
+        dst[1] = BASE16_ALPHABET[ *pos     & 0xF];
+    }
+    dst[0] = '\0';
+}
+
+int base16_dec(uint8_t *dst, char *src, unsigned int *len){
+	const char *pos = src;
+	char *endptr;
+	unsigned int 	i;
+
+	if ((src[0] == '\0') || (strlen(src) % 2))
+		return -1;
+
+	for(i = 0; i < (strlen(src)/2); i++) {
+		char buf[5] = {'0', 'x', pos[0], pos[1], 0};
+		dst[i] = strtol(buf, &endptr, 0);
+		pos += 2 * sizeof(char);
+
+	    if (endptr[0] != '\0')
+			return -1;
+	}
+	*len = (unsigned int) (strlen(src)/2);
+	return 0;
+}
+
 /* Print found .onion name and PEM formatted RSA key. */
-void 
+void
 printresult(RSA *rsa, uint8_t *target, uint8_t *actual)
-{	
+{
 	uint8_t		*dst;
 	BUF_MEM		*buf;
 	BIO		*b;
@@ -522,12 +621,22 @@ printresult(RSA *rsa, uint8_t *target, uint8_t *actual)
 	memcpy(dst, buf->data, buf->length);
 
 	dst[buf->length] = '\0';
-	
-	msg("Found a key for %s (%d) - %s.onion\n",
-	    target, strnlen((char *)target, ONION_LENP1), actual);
-	printf("----------------------------------------------------------------\n");
-	printf("%s.onion\n", actual);
-	printf("%s\n", dst);
+
+	if (fpflag){
+		msg("Found a key with fingerprint - %s\n", actual);
+		printf("%s\n", actual);
+		printf("%s", dst);
+	} else if (descflag){
+		msg("Found a key for %s.onion with descriptor - %s\n", target, actual);
+		printf("%s\n", actual);
+		printf("%s.onion\n", target);
+		printf("%s", dst);
+	} else {
+		msg("Found a key for %s (%d) - %s.onion\n",
+		    target, strnlen((char *)target, ONION_LENP1), actual);
+		printf("%s.onion\n", actual);
+		printf("%s", dst);
+	}
 	fflush(stdout);
 
 	BUF_MEM_free(buf);
@@ -537,9 +646,9 @@ printresult(RSA *rsa, uint8_t *target, uint8_t *actual)
 /* Generate .onion name from the RSA key. */
 /* (using the same method as the official TOR client) */
 void
-onion_enc(uint8_t *onion, RSA *rsa)
+onion_enc(uint8_t *digest, RSA *rsa)
 {
-	uint8_t		*bufa, *bufb, digest[SHA_DIGEST_LENGTH];
+	uint8_t		*bufa, *bufb;
 	signed int	derlen;
 
 	if((derlen = i2d_RSAPublicKey(rsa, NULL)) < 0)
@@ -553,7 +662,6 @@ onion_enc(uint8_t *onion, RSA *rsa)
 
 	SHA1(bufa, derlen, digest);
 	free(bufa);
-	base32_enc(onion, digest);
 }
 
 /* Compare function for qsort(3). */
@@ -568,20 +676,20 @@ compare (const void *a, const void *b)
 }
 
 /* Wordlist mode search. */
-_Bool	
+_Bool
 fsearch(uint8_t *buf, uint8_t *onion)
 {
 	unsigned int i;
 	uint16_t ind;
 	uint64_t wrd;
 
-	if (!nflag)
+	if (nflag)
 		for (i = 0; i < minlen; i++)
 			if (onion[i] < 'a')
 				return 0;
 
 	for (i = minlen; i <= maxlen; i++) {
-		if (!nflag && onion[i - 1] < 'a')
+		if (nflag && onion[i - 1] < 'a')
 			return 0;
 
 		zerobits(&ind, &wrd, buf, i);
@@ -597,14 +705,14 @@ fsearch(uint8_t *buf, uint8_t *onion)
 }
 
 /* Regex mode search. */
-_Bool	
+_Bool
 rsearch(__attribute__((unused)) uint8_t *buf, uint8_t *onion)
 {
 	return !regexec(regex, (char *)onion, 0, 0, 0);
 }
 
 /* Fixed prefix mode search. */
-_Bool	
+_Bool
 psearch(__attribute__((unused)) uint8_t *buf, uint8_t *onion)
 {
 	return !memcmp(onion, prefix, prefixlen);
@@ -639,13 +747,65 @@ zerobits(uint16_t * ind, uint64_t * word, uint8_t * buffer, unsigned int length)
 	memcpy(word, &bufcopy[2], 8);
 }
 
+static void
+rend_get_descriptor_id_bytes(unsigned char *descriptor_id_out,
+			uint8_t *service_id,
+			uint8_t *secret_id_part)
+{
+	SHA_CTX	digest;
+	SHA1_Init(&digest);
+	SHA1_Update(&digest, service_id, REND_SERVICE_ID_LEN);
+	SHA1_Update(&digest, secret_id_part, SHA_DIGEST_LENGTH);
+	SHA1_Final(descriptor_id_out, &digest);
+}
+
+static void
+get_secret_id_part_bytes(unsigned char *secret_id_part, uint32_t time_period,
+                         const char *descriptor_cookie, uint8_t replica)
+{
+	SHA_CTX	digest;
+	SHA1_Init(&digest);
+	time_period = htonl(time_period);
+	SHA1_Update(&digest, (char*)&time_period, sizeof(uint32_t));
+	if (descriptor_cookie) {
+		SHA1_Update(&digest, descriptor_cookie, REND_DESC_COOKIE_LEN);
+	}
+	SHA1_Update(&digest, (const char *)&replica, 1);
+	SHA1_Final(secret_id_part, &digest);
+}
+
+static uint32_t
+get_time_period(time_t now, uint8_t deviation, uint8_t *service_id)
+{
+  return (uint32_t)
+    (now + ((uint8_t) *service_id) * REND_TIME_PERIOD_V2_DESC_VALIDITY / 256)
+    / REND_TIME_PERIOD_V2_DESC_VALIDITY + deviation;
+}
+
+int
+rend_compute_v2_desc_id(uint8_t *desc_id_out, uint8_t *service_id,
+                        const char *descriptor_cookie, time_t now,
+                        uint8_t replica)
+{
+  uint8_t service_id_binary[REND_SERVICE_ID_LEN];
+  uint8_t secret_id_part[SHA_DIGEST_LENGTH];
+  uint32_t time_period;
+  base32_dec(service_id_binary, service_id);
+  time_period = get_time_period(now, 0, service_id_binary);
+  get_secret_id_part_bytes(secret_id_part, time_period, descriptor_cookie,
+                           replica);
+  rend_get_descriptor_id_bytes(desc_id_out, service_id_binary, secret_id_part);
+  return 0;
+}
+
 /* Read arguments and set global variables. */
 void
 setoptions(int argc, char *argv[])
 {
 	int ch;
 
-	while ((ch = getopt(argc, argv, "cnvt:l:f:p:r:")) != -1)
+	//while ((ch = getopt(argc, argv, "cnvit:l:f:d:p:r:")) != -1)
+	while ((ch = getopt(argc, argv, "cinvd:t:l:f:p:r:")) != -1)
 		switch (ch) {
 		case 'c':
 			cflag = 1;
@@ -685,9 +845,11 @@ setoptions(int argc, char *argv[])
 				usage();
 			for (unsigned int i = 0; i < prefixlen; i++) {
 				prefix[i] = tolower(prefix[i]);
-				if (!isalpha(prefix[i]) && (!nflag || !isdigit(prefix[i]) ||
-				     prefix[i] < '2' || prefix[i] > '7'))
-					usage();
+				if (!(descflag || fpflag)){
+					if (!isalpha(prefix[i]) && (nflag || !isdigit(prefix[i]) ||
+					     prefix[i] < '2' || prefix[i] > '7'))
+						usage();
+				}
 			}
 			search = psearch;
 			break;
@@ -703,17 +865,32 @@ setoptions(int argc, char *argv[])
 				error("Failed to compile regex expression!\n");
 			search = rsearch;
 			break;
+		case 'd':
+			descflag = 1;
+			desctime = strtoul(optarg, NULL, 0);
+			break;
+		case 'i':
+			fpflag = 1;
+			break;
+		case ':':
+			switch (optopt){
+				case 'd':
+					descflag = 1;
+					desctime = time(0);
+			}
 		default:
 			usage();
 			/* NOTREACHED */
 		}
 
-	if (fflag + rflag + pflag != 1)
+	if (fflag + rflag + pflag != 1){
+		printf("no f, r or p flag");
 		usage();
+	}
 
 	msg("Verbose, ");
 	cflag ?	msg("continuous, ") : msg("single result, ");
-	nflag ?	msg("digits ok, ")  : msg("no digits, ");
+	!nflag ?	msg("digits ok, ")  : msg("no digits, ");
 	msg("%d threads, prefixes %d-%d characters long.\n",
 	    threads, minlen, maxlen);
 }
@@ -726,21 +903,25 @@ usage(void)
 	    "Version: %s\n"
 	    "\n"
 	    "usage:\n"
-	    "%s [-c] [-v] [-t count] ([-n] [-l min-max] -f filename) | (-r regex) | (-p prefix)\n"
+	    "%s [-c] [-v] [-t count] [-d time] [-i] ([-n] [-l min-max] -f filename) | (-r regex) | (-p prefix)\n"
 	    "  -v         : verbose mode - print extra information to STDERR\n"
 	    "  -c         : continue searching after the hash is found\n"
 	    "  -t count   : number of threads to spawn default is one)\n"
 	    "  -l min-max : look for prefixes that are from 'min' to 'max' characters long\n"
-	    "  -n         : Allow digits to be part of the prefix (affects wordlist mode only)\n"
+	    "  -n         : Do not allow digits to be part of the prefix (affects wordlist mode only)\n"
 	    "  -f filename: name of the text file with a list of prefixes\n"
 	    "  -p prefix  : single prefix to look for (1-16 characters long)\n"
 	    "  -r regex   : search for a POSIX-style regular expression\n"
+	    "  -i         : search for key fingerprint rather than onion\n"
+	    "  -d time    : search for onion key with a specified descriptor prefix\n"
 	    "\n"
 	    "Examples:\n"
 	    "  %s -cvt4 -l8-12 -f wordlist.txt >> results.txt\n"
 	    "  %s -v -r '^test|^exam'\n"
-	    "  %s -ct5 -p test\n\n",
-	    VERSION, __progname, __progname, __progname, __progname);
+	    "  %s -ct5 -p test\n"
+	    "  %s -i -p a9f4c1d9\n"
+	    "  %s -d 1417962459 -p a9f4c1d8\n\n",
+	    VERSION, __progname, __progname, __progname, __progname, __progname, __progname);
 
 	fprintf(stderr,
 	    "  base32 alphabet allows letters [a-z] and digits [2-7]\n"
@@ -752,7 +933,8 @@ usage(void)
 	    "    '^ab|^cd'     must begin with 'ab' or 'cd'\n"
 	    "    [a-z]{16}     must contain letters only, no digits\n"
 	    "    ^dusk.*dawn$  must begin with 'dusk' and end with 'dawn'\n"
-	    "    [a-z2-7]{16}  any name - will succeed after one iteration\n");
+	    "    [a-z2-7]{16}  any name - will succeed after one iteration\n"
+	    " If the -i or -d options are set, the prefix should be hex encoded\n");
 
 	exit(1);
 }
