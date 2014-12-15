@@ -135,10 +135,13 @@ static void		*worker(void *);
 
 /* Global variables */
 /* TODO: perhaps getting rid of so many globals is in order... */
-_Bool			done, cflag, fflag, nflag, pflag, rflag, vflag, descflag, fpflag;
+_Bool			done, cflag, fflag, nflag, pflag, rflag, vflag, descflag, fpflag, secflag;
 unsigned int		minlen, maxlen, threads, prefixlen, wordcount, prefixbytelen;
+unsigned int service_id_hex_len = REND_SERVICE_ID_LEN*2;
 uint32_t desctime;
 char			fn[FILENAME_MAX + 1], prefix[ONION_LENP1];
+char service_id_in[(REND_SERVICE_ID_LEN*2)+1];
+
 regex_t			*regex;
 
 struct {
@@ -249,18 +252,67 @@ worker(void *arg)
 			prefixbytes[ONION_LENP1],
 			digest[SHA_DIGEST_LENGTH],
 			descriptor_id[SHA_DIGEST_LENGTH],
-			descriptor_hex[(SHA_DIGEST_LENGTH*2)+1];
+			service_id_bytes[SHA_DIGEST_LENGTH],
+			secret_id_part_bytes[SHA_DIGEST_LENGTH],
+			descriptor_hex[(SHA_DIGEST_LENGTH*2)+1],
+			secret_id_part[(SHA_DIGEST_LENGTH*2)+1];
 	signed int	derlen;
 	uint64_t	*counter;
 	/* Public exponent and the "big-endian" version of it */
-	unsigned int	e, e_be, i;
+	unsigned int	e, e_be, i, res;
+	FILE *randfp;
+
 
 	counter = (uint64_t *)arg;
 
-	if(pflag && (fpflag || descflag)){
+	if(pflag && (fpflag || descflag || secflag)){
 		/* Decode the hex encoded prefix */
 		if(base16_dec(prefixbytes, prefix, &prefixbytelen))
 			error("The prefix is not a valid hex encoded string\n");
+
+		if(secflag){
+			if(base16_dec(service_id_bytes, service_id_in, &service_id_hex_len))
+				error("The service_id is not a valid hex encoded string\n");
+		}
+	}
+
+	// Brute force secret-id-part which generates a desc ID with prefix
+	// Don't need to actually generate an RSA key
+	if(secflag){
+		randfp = fopen("/dev/urandom", "r");
+
+		SHA_CTX	hash_digest;
+		SHA1_Init(&hash_digest);
+		SHA1_Update(&hash_digest, service_id_bytes, REND_SERVICE_ID_LEN);
+
+		while (!done) {
+			// Get random 20 bytes
+			res = fread(&secret_id_part_bytes, 1, SHA_DIGEST_LENGTH, randfp);
+			if (res != SHA_DIGEST_LENGTH) { continue; }
+
+			memcpy(&copy, &hash_digest, SHA_REL_CTX_LEN); /* 40 bytes */
+			copy.num = hash_digest.num;
+			SHA1_Update(&copy, secret_id_part_bytes, SHA_DIGEST_LENGTH);
+			SHA1_Final(descriptor_id, &copy);
+
+			if(memcmp(prefixbytes, descriptor_id, prefixbytelen)==0){
+				// Found a suitable descriptor id
+				base16_enc(secret_id_part, secret_id_part_bytes, SHA_DIGEST_LENGTH);
+				base16_enc(descriptor_hex, descriptor_id, SHA_DIGEST_LENGTH);
+
+
+				msg("Found a secret_id_part with descriptor %s\n", descriptor_hex);
+				printf("%s\n", secret_id_part);
+				printf("%s\n", descriptor_hex);
+
+				if (!cflag)
+					done = 1; /* Notify other threads. */
+				break;
+			}
+
+		}
+		fclose(randfp);
+		return 0;
 	}
 
 	while (!done) {
@@ -804,8 +856,7 @@ setoptions(int argc, char *argv[])
 {
 	int ch;
 
-	//while ((ch = getopt(argc, argv, "cnvit:l:f:d:p:r:")) != -1)
-	while ((ch = getopt(argc, argv, "cinvd:t:l:f:p:r:")) != -1)
+	while ((ch = getopt(argc, argv, "cinvd:t:s:l:f:p:r")) != -1)
 		switch (ch) {
 		case 'c':
 			cflag = 1;
@@ -845,7 +896,7 @@ setoptions(int argc, char *argv[])
 				usage();
 			for (unsigned int i = 0; i < prefixlen; i++) {
 				prefix[i] = tolower(prefix[i]);
-				if (!(descflag || fpflag)){
+				if (!(descflag || fpflag || secflag)){
 					if (!isalpha(prefix[i]) && (nflag || !isdigit(prefix[i]) ||
 					     prefix[i] < '2' || prefix[i] > '7'))
 						usage();
@@ -872,6 +923,10 @@ setoptions(int argc, char *argv[])
 		case 'i':
 			fpflag = 1;
 			break;
+		case 's':
+			secflag = 1;
+			strncpy(service_id_in, optarg, (REND_SERVICE_ID_LEN*2)+1);
+			break;
 		case ':':
 			switch (optopt){
 				case 'd':
@@ -884,7 +939,7 @@ setoptions(int argc, char *argv[])
 		}
 
 	if (fflag + rflag + pflag != 1){
-		printf("no f, r or p flag");
+		printf("no f, r or p flag\n");
 		usage();
 	}
 
@@ -903,7 +958,7 @@ usage(void)
 	    "Version: %s\n"
 	    "\n"
 	    "usage:\n"
-	    "%s [-c] [-v] [-t count] [-d time] [-i] ([-n] [-l min-max] -f filename) | (-r regex) | (-p prefix)\n"
+	    "%s [-c] [-v] [-t count] [-d time] [-s SERVICE_ID] [-i] ([-n] [-l min-max] -f filename) | (-r regex) | (-p prefix)\n"
 	    "  -v         : verbose mode - print extra information to STDERR\n"
 	    "  -c         : continue searching after the hash is found\n"
 	    "  -t count   : number of threads to spawn default is one)\n"
@@ -914,14 +969,16 @@ usage(void)
 	    "  -r regex   : search for a POSIX-style regular expression\n"
 	    "  -i         : search for key fingerprint rather than onion\n"
 	    "  -d time    : search for onion key with a specified descriptor prefix\n"
+	    "  -s service_id : search for secret-id-part with descriptor_id prefix\n"
 	    "\n"
 	    "Examples:\n"
 	    "  %s -cvt4 -l8-12 -f wordlist.txt >> results.txt\n"
 	    "  %s -v -r '^test|^exam'\n"
 	    "  %s -ct5 -p test\n"
 	    "  %s -i -p a9f4c1d9\n"
-	    "  %s -d 1417962459 -p a9f4c1d8\n\n",
-	    VERSION, __progname, __progname, __progname, __progname, __progname, __progname);
+	    "  %s -d 1417962459 -p a9f4c1d8\n"
+	    "  %s -s be6ffae21b9c3da0e850 -p a9f3c1\n\n"
+	    VERSION, __progname, __progname, __progname, __progname, __progname, __progname, __progname, __progname);
 
 	fprintf(stderr,
 	    "  base32 alphabet allows letters [a-z] and digits [2-7]\n"
@@ -934,7 +991,7 @@ usage(void)
 	    "    [a-z]{16}     must contain letters only, no digits\n"
 	    "    ^dusk.*dawn$  must begin with 'dusk' and end with 'dawn'\n"
 	    "    [a-z2-7]{16}  any name - will succeed after one iteration\n"
-	    " If the -i or -d options are set, the prefix should be hex encoded\n");
+	    " If the -i, -d or -s options are set, the prefix should be hex encoded\n");
 
 	exit(1);
 }
